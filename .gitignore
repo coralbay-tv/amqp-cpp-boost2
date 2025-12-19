@@ -1,0 +1,20 @@
+#ignore BUILD directory
+/build/*
+/binary/*
+/build.*/*
+/release/*
+/debug/*
+
+#CLion-created directories.
+/cmake-build-debug/*
+/cmake-build-release/*
+/cmake-build-minsizerel*
+/cmake-build-relwithdebinfo*
+
+/.idea/*
+
+# QtCreator
+*.user
+
+# Visual Studio Code
+**/.vscode
