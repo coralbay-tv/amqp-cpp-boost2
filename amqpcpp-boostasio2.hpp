@@ -33,7 +33,7 @@
 /**
  * Dependencies
  */
-#include "amqpcpp/linux_tcp.h"
+#include <amqpcpp.h>
 
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/strand.hpp>
@@ -205,7 +205,7 @@ protected:
          * @note   The handler will get called if a read is cancelled.
          */
         void read_handler(const boost::system::error_code &ec,
-                          const std::size_t /*bytes_transferred*/, // Stops: -Wunused-parameter
+                          const std::size_t, // Name omitted intentionally
                           const std::weak_ptr<Watcher> awpWatcher)
         {
             // Resolve any potential problems with dangling pointers
@@ -236,7 +236,7 @@ protected:
          * @note   The handler will get called if a write is cancelled.
          */
         void write_handler(const boost::system::error_code ec,
-                           const std::size_t /*bytes_transferred*/, // Stops: -Wunused-parameter
+                           const std::size_t, // Name omitted intentionally
                            const std::weak_ptr<Watcher> awpWatcher)
         {
             // Resolve any potential problems with dangling pointers
