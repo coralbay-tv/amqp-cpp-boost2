@@ -75,10 +75,11 @@ protected:
         boost::asio::io_context & _iocontext;
 
         /**
-         * The boost asio io_context::strand managed pointer.
-         * @var class std::shared_ptr<boost::asio::io_context>
+         * The boost asio io_context::strand.
+         * Owned locally to ensure this connection's handlers are serialized,
+         * while allowing other connections to run in parallel.
          */
-        std::shared_ptr<boost::asio::io_context::strand> _strand;
+        boost::asio::strand<boost::asio::io_context::executor_type> _strand;
 
         /**
          * The boost tcp socket.
@@ -148,7 +149,7 @@ protected:
         {
             // boost::asio::bind_executor returns a wrapper that strictly
             // forces the function to run on the specified strand.
-            return boost::asio::bind_executor(*_strand, std::forward<Function>(func));
+            return boost::asio::bind_executor(_strand, std::forward<Function>(func));
         }
 
         /**
@@ -294,16 +295,14 @@ protected:
          * Constructor- initialises the watcher and assigns the filedescriptor to
          * a boost socket for monitoring.
          * @param  io_context      The boost io_context
-         * @param  strand          A pointer to a io_context::strand instance.
          * @param  connection      The connection being watched
          * @param  fd              The filedescriptor being watched
          */
         Watcher(boost::asio::io_context &io_context,
-                const std::shared_ptr<boost::asio::io_context::strand> strand,
                 TcpConnection* connection,
                 const int fd) :
             _iocontext(io_context),
-            _strand(strand),
+            _strand(boost::asio::make_strand(io_context)), // Improvement #2: New strand per connection
             _socket(io_context),
             _timer(io_context),
             _connection(connection),
@@ -397,14 +396,6 @@ protected:
      */
     boost::asio::io_context & _iocontext;
 
-    using strand_shared_ptr = std::shared_ptr<boost::asio::io_context::strand>;
-
-    /**
-     * The boost asio io_context::strand managed pointer.
-     * @var class std::shared_ptr<boost::asio::io_context>
-     */
-    strand_shared_ptr _strand;
-
     /**
      * All I/O watchers that are active, indexed by their filedescriptor
      * @var std::map<int,Watcher>
@@ -433,11 +424,10 @@ protected:
 
         if (inserted)
         {
-            // Pass connection pointer here once during construction
-            iter->second = std::make_shared<Watcher>(_iocontext, _strand, connection, fd);
+
+            iter->second = std::make_shared<Watcher>(_iocontext, connection, fd);
         }
 
-        // Call events without passing connection or fd again
         iter->second->events(flags);
     }
 
@@ -479,10 +469,8 @@ public:
      * @param  io_context    The boost io_context to wrap
      */
     explicit LibBoostAsioHandler2(boost::asio::io_context &io_context) :
-        _iocontext(io_context),
-        _strand(std::make_shared<boost::asio::io_context::strand>(_iocontext))
+        _iocontext(io_context)
     {
-
     }
 
     /**
