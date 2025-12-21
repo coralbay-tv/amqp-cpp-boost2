@@ -44,8 +44,8 @@
 
 #include <chrono>
 #include <functional>
-#include <map>
 #include <memory>
+#include <unordered_map>
 
 
 /**
@@ -400,7 +400,7 @@ protected:
      * All I/O watchers that are active, indexed by their filedescriptor
      * @var std::map<int,Watcher>
      */
-    std::map<int, std::shared_ptr<Watcher> > _watchers;
+	std::unordered_map<int, std::shared_ptr<Watcher>> _watchers;
 
     /**
      * Method that is called by AMQP-CPP to register a filedescriptor for readability or writability
