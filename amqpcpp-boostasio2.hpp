@@ -34,17 +34,18 @@
  * Dependencies
  */
 #include <amqpcpp.h>
+#include <amqpcpp/linux_tcp.h>
 
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/strand.hpp>
 #include <boost/asio/steady_timer.hpp>
 #include <boost/asio/posix/stream_descriptor.hpp>
-#include <boost/asio/dispatch.hpp>
 #include <boost/asio/bind_executor.hpp>
 
+#include <algorithm>
 #include <chrono>
-#include <functional>
 #include <memory>
+#include <optional>
 #include <unordered_map>
 
 
@@ -98,7 +99,7 @@ protected:
          * The connection being watched.
          * Stored here to avoid passing it through every handler signature.
          */
-        TcpConnection* _connection;
+        TcpConnection* _connection{};
 
         /**
          * A boolean that indicates if the watcher is monitoring for read events.
@@ -130,9 +131,35 @@ protected:
          */
         int _fd;
 
-        using handler_cb = std::function<void(boost::system::error_code, std::size_t)>;
-        using io_handler = std::function<void(const boost::system::error_code&, const std::size_t)>;
-        using timer_handler = std::function<void(boost::system::error_code)>;
+		/**
+         * Context for AMQP Heartbeats.
+         */
+        struct HeartbeatContext
+		{
+            /**
+             * The negotiated heartbeat interval in seconds.
+             */
+            uint16_t interval{};
+
+            /**
+             * The deadline for sending the next heartbeat frame to the server.
+             * Calculated as: Last Activity + (Interval * 0.5)
+             */
+            std::chrono::steady_clock::time_point next_heartbeat{};
+
+            /**
+             * The deadline for receiving data from the server.
+             * If no data is received by this time, the connection is considered dead.
+             * Calculated as: Last Activity + (Interval * 1.5)
+             */
+            std::chrono::steady_clock::time_point expire_time{};
+        };
+
+        /**
+         * Optional storage for heartbeat state.
+         * If std::nullopt, heartbeats are disabled or not yet negotiated.
+         */
+        std::optional<HeartbeatContext> _heartbeat;
 
         /**
          * Helper to bind a handler callback to the connection's strand.
@@ -156,7 +183,7 @@ protected:
          * Binds and returns a read handler for the io operation.
          * @return handler callback
          */
-        handler_cb get_read_handler()
+        auto get_read_handler()
         {
             auto self = weak_from_this();
             auto fn = [this, self{std::move(self)}](const boost::system::error_code &ec, const std::size_t bytes) {
@@ -169,7 +196,7 @@ protected:
          * Binds and returns a write handler for the io operation.
          * @return handler callback
          */
-        handler_cb get_write_handler()
+        auto get_write_handler()
         {
             auto self = weak_from_this();
             auto fn = [this, self{std::move(self)}](const boost::system::error_code &ec, const std::size_t bytes) {
@@ -180,17 +207,16 @@ protected:
 
         /**
          * Binds and returns a lambda function handler for the timer operation.
-         * @param  timeout      The timeout interval in seconds.
          * @return handler callback bound to the strand
          */
-        std::function<void(const boost::system::error_code&)> get_timer_handler(const uint16_t timeout)
+        auto get_timer_handler()
         {
             auto self = weak_from_this();
 
             // The actual logic that runs when timer fires
-            auto fn = [this, self{std::move(self)}, timeout](const boost::system::error_code &ec) {
+            auto fn = [this, self{std::move(self)}](const boost::system::error_code &ec) {
                 // Pass to the member function
-                this->timeout_handler(ec, self, timeout);
+                this->timeout_handler(ec, self);
             };
 
             // Wrap it so it runs strictly on the strand
@@ -201,22 +227,34 @@ protected:
          * Handler method that is called by boost's io_context when the socket pumps a read event.
          * @param  ec          The status of the callback.
          * @param  bytes_transferred The number of bytes transferred.
-         * @param  awpWatcher  A weak pointer to this object.
+         * @param  weakWatcher  A weak pointer to this object.
          * @note   The handler will get called if a read is cancelled.
          */
         void read_handler(const boost::system::error_code &ec,
                           const std::size_t, // Name omitted intentionally
-                          const std::weak_ptr<Watcher> awpWatcher)
+                          const std::weak_ptr<Watcher> weakWatcher)
         {
             // Resolve any potential problems with dangling pointers
             // (remember we are using async).
-            const std::shared_ptr<Watcher> watcher = awpWatcher.lock();
+            const auto watcher = weakWatcher.lock();
             if (!watcher) { return; }
 
             _read_pending = false;
 
             if ((!ec || ec == boost::asio::error::would_block) && _read)
             {
+				// ACTIVITY DETECTED: Update expire time if heartbeats are active.
+                // We set the expiry to Now + (Interval * 1.5).
+                if (_heartbeat)
+                {
+                    // Rule: Disconnect at 150% of timeout.
+                    // We calculate this using typed durations for safety.
+                    const auto interval_sec = std::chrono::seconds(_heartbeat->interval);
+                    const auto interval_ms = std::chrono::duration_cast<std::chrono::milliseconds>(interval_sec);
+
+                    _heartbeat->expire_time = std::chrono::steady_clock::now() + interval_ms + (interval_ms / 2);
+                }
+
                 // Use member _connection and _fd
                 _connection->process(_fd, AMQP::readable);
 
@@ -232,16 +270,16 @@ protected:
          * Handler method that is called by boost's io_context when the socket pumps a write event.
          * @param  ec          The status of the callback.
          * @param  bytes_transferred The number of bytes transferred.
-         * @param  awpWatcher  A weak pointer to this object.
+         * @param  weakWatcher  A weak pointer to this object.
          * @note   The handler will get called if a write is cancelled.
          */
         void write_handler(const boost::system::error_code ec,
                            const std::size_t, // Name omitted intentionally
-                           const std::weak_ptr<Watcher> awpWatcher)
+                           const std::weak_ptr<Watcher> weakWatcher)
         {
             // Resolve any potential problems with dangling pointers
             // (remember we are using async).
-            const std::shared_ptr<Watcher> watcher = awpWatcher.lock();
+            const auto watcher = weakWatcher.lock();
             if (!watcher) { return; }
 
             _write_pending = false;
@@ -260,33 +298,60 @@ protected:
         }
 
         /**
-         * Callback method that is called by libev when the timer expires
-         * @param  ec          error code returned from loop
-         * @param  loop        The loop in which the event was triggered
-         * @param  timeout
+         * Internal handler for timer expiry.
+         *
+         * Checks two conditions:
+         * 1. Has the connection expired? (Server silent too long) -> Close.
+         * 2. Is it time to send a heartbeat? -> Send & Reschedule.
+         *
+         * @param ec          Boost error code
+         * @param weakWatcher Weak pointer to self for lifetime safety
          */
         void timeout_handler(const boost::system::error_code &ec,
-                     std::weak_ptr<Watcher> awpThis,
-                     const uint16_t timeout)
+                             std::weak_ptr<Watcher> weakWatcher)
         {
             // Resolve any potential problems with dangling pointers
             // (remember we are using async).
-            const std::shared_ptr<Watcher> apTimer = awpThis.lock();
-            if (!apTimer) { return; }
+            const auto watcher = weakWatcher.lock();
+            if (!watcher) { return; }
 
             if (!ec)
             {
-                if (_connection)
+				if (!_heartbeat.has_value()) { return; }
+
+				const auto now = std::chrono::steady_clock::now();
+
+				// 1. Check Expiration (Server Dead?)
+                if (now >= _heartbeat->expire_time)
                 {
-                    // send the heartbeat
-                    _connection->heartbeat();
+                    // Force close the connection immediately.
+                    if (_connection) { _connection->close(true); }
+                    return;
                 }
 
-                // Reschedule the timer for the future:
-                _timer.expires_after(std::chrono::seconds(timeout));
+                // 2. Check Next Tick (Send Heartbeat?)
+                if (now >= _heartbeat->next_heartbeat)
+                {
+                    if (_connection) { _connection->heartbeat(); }
 
-                // Posts the timer event
-                _timer.async_wait(get_timer_handler(timeout));
+                    // Calculate next intervals using idiomatic C++ chrono types
+                    const auto interval_sec = std::chrono::seconds(_heartbeat->interval);
+                    const auto interval_ms = std::chrono::duration_cast<std::chrono::milliseconds>(interval_sec);
+
+                    // Rule: Send at 50% of timeout, but minimum 1 second.
+                    const auto next_delay = std::max(interval_ms / 2, std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::seconds(1)));
+
+                    _heartbeat->next_heartbeat = now + next_delay;
+
+                    // Re-calculate expiry to keep it moving forward relative to now
+                    _heartbeat->expire_time = now + interval_ms + (interval_ms / 2);
+                }
+
+                // 3. Reschedule Timer
+                // Sleep until the earliest of: (Next Heartbeat) OR (Connection Expiry)
+                const auto next_trigger = std::min(_heartbeat->next_heartbeat, _heartbeat->expire_time);
+                _timer.expires_at(next_trigger);
+                _timer.async_wait(get_timer_handler());
             }
         }
 
@@ -364,20 +429,39 @@ protected:
             }
         }
 
-        /**
-         * Change the expire time
-         * @param  timeout
+		/**
+         * Initialize or Update the heartbeat schedule.
+         * * @param timeout The heartbeat interval in seconds (0 to disable).
          */
-        void set_timer(uint16_t timeout)
+        void initialize_heartbeat(const uint16_t timeout)
         {
-            // stop timer in case it was already set
             stop_timer();
 
-            // Reschedule the timer for the future:
-            _timer.expires_after(std::chrono::seconds(timeout));
+            if (timeout > 0)
+            {
+                const auto now = std::chrono::steady_clock::now();
 
-            // Posts the timer event
-            _timer.async_wait(get_timer_handler(timeout));
+                auto& hb = _heartbeat.emplace();
+                hb.interval = timeout;
+
+                // Use idiomatic C++ types for calculations
+                const auto interval_sec = std::chrono::seconds(timeout);
+                const auto interval_ms = std::chrono::duration_cast<std::chrono::milliseconds>(interval_sec);
+
+                // Next heartbeat: Now + (Timeout * 0.5)
+                hb.next_heartbeat = now + (interval_ms / 2);
+
+                // Expiry: Now + (Timeout * 1.5)
+                hb.expire_time = now + interval_ms + (interval_ms / 2);
+
+                const auto next_trigger = std::min(hb.next_heartbeat, hb.expire_time);
+                _timer.expires_at(next_trigger);
+                _timer.async_wait(get_timer_handler());
+            }
+            else
+            {
+                _heartbeat.reset();
+            }
         }
 
         /**
@@ -441,15 +525,15 @@ protected:
     uint16_t onNegotiate(TcpConnection *connection, uint16_t interval) override
     {
         // skip if no heartbeats are needed
-        if (interval == 0) return 0;
+        if (interval == 0) { return 0; }
 
         const auto fd = connection->fileno();
 
         auto iter = _watchers.find(fd);
         if (iter == _watchers.end()) return 0;
 
-        // set the timer (no connection needed)
-        iter->second->set_timer(interval);
+        // no connection needed
+        iter->second->initialize_heartbeat(interval);
 
         // we agree with the interval
         return interval;
