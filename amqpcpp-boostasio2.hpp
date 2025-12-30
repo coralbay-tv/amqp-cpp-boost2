@@ -342,9 +342,6 @@ protected:
                     const auto next_delay = std::max(interval_ms / 2, std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::seconds(1)));
 
                     _heartbeat->next_heartbeat = now + next_delay;
-
-                    // Re-calculate expiry to keep it moving forward relative to now
-                    _heartbeat->expire_time = now + interval_ms + (interval_ms / 2);
                 }
 
                 // 3. Reschedule Timer
