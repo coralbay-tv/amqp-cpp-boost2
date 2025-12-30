@@ -239,6 +239,9 @@ protected:
             const auto watcher = weakWatcher.lock();
             if (!watcher) { return; }
 
+            // Safety: If monitor(fd, 0) was called, the connection is detached.
+            if (!watcher->_connection) { return; }
+
             _read_pending = false;
 
             if ((!ec || ec == boost::asio::error::would_block) && _read)
@@ -282,6 +285,9 @@ protected:
             const auto watcher = weakWatcher.lock();
             if (!watcher) { return; }
 
+            // Safety: If monitor(fd, 0) was called, the connection is detached.
+            if (!watcher->_connection) { return; }
+
             _write_pending = false;
 
             if ((!ec || ec == boost::asio::error::would_block) && _write)
@@ -314,6 +320,8 @@ protected:
             // (remember we are using async).
             const auto watcher = weakWatcher.lock();
             if (!watcher) { return; }
+
+            if (!watcher->_connection) { return; }
 
             if (!ec)
             {
@@ -387,10 +395,45 @@ protected:
          */
         ~Watcher()
         {
+            close();
+        }
+
+        // Inside Watcher class
+        void close()
+        {
+            boost::system::error_code ec;
+
+            // 1. Cancel IO explicitly
+            // This forces all pending handlers to run immediately with 'operation_aborted'.
+            _socket.cancel(ec);
+
+            // 2. Release the socket ownership
+            // POSIX stream_descriptor::release() throws on error and has no 'ec' overload.
+     		// We catch and ignore exceptions because we are destroying the object anyway.
+    		try
+    		{
+        		_socket.release();
+    		}
+    		catch (...)
+    		{
+        		// Ignored: FD might already be closed or invalid.
+    		}
+
+            // 3. Stop Heartbeat Timer
+            _timer.cancel(ec);
+
+            // 4. Detach Connection (The Critical Zombie Fix)
+            // This ensures that when those cancelled handlers run, they see nullptr.
+            _connection = nullptr;
+
+            // 5. Clear state flags
             _read = false;
             _write = false;
-            _socket.release();
-            _timer.cancel();
+            _read_pending = false;
+            _write_pending = false;
+
+            // Note: We do not check 'ec' because we are tearing down.
+            // Failures here are usually ignored.
         }
 
         /**
@@ -496,8 +539,14 @@ protected:
 		// Case 1: Stop monitoring (flags == 0)
 		if (flags == 0)
 		{
-			_watchers.erase(fd);
-			return;
+		    if (auto iter = _watchers.find(fd);
+		        iter != _watchers.end())
+		    {
+		        // Explicitly sever the link to the TcpConnection
+		        iter->second->close();
+		        _watchers.erase(iter);
+		    }
+		    return;
 		}
 
         // Case 2: Start or Update monitoring
